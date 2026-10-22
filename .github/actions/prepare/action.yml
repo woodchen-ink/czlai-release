@@ -1,0 +1,70 @@
+# 两个平台共用的构建准备：构建站点前端并放进桌面端内嵌目录、装 Go 与 Wails CLI。
+#
+# 前端在各平台 job 里各建一次，不经 artifact 传递：公开仓库的 artifact 谁都能下载，
+# 只允许上传最终安装包。
+#
+# 防泄露（本仓库公开，日志 / cache 都对外可见）：
+#   - 前端构建输出写入临时文件，失败时只打印错误位置与说明，不打印带源码的 code frame
+#   - Go 只缓存 module 下载目录，不缓存 build cache（setup-go 内置 cache 会连带缓存，故关闭）
+
+name: Prepare
+description: 构建内嵌前端并安装 Go / Wails CLI
+
+inputs:
+  version:
+    description: 版本号（vX.Y.Z），注入前端 VITE_APP_VERSION
+    required: true
+  wails-version:
+    description: Wails CLI 版本，与源码 desktop/go.mod 中的 wails 版本一致
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v7
+      with:
+        node-version: '22'
+        cache: yarn
+        cache-dependency-path: src/web/yarn.lock
+
+    - name: 构建前端
+      shell: bash
+      working-directory: src/web
+      env:
+        DISABLE_ESLINT_PLUGIN: 'true'
+        VITE_APP_VERSION: ${{ inputs.version }}
+      run: |
+        yarn install --frozen-lockfile --silent
+        log="$RUNNER_TEMP/web-build.log"
+        if ! yarn build >"$log" 2>&1; then
+          # Vite / esbuild 报错带源码片段（code frame，形如 `12 | ...`、`   | ^`），只输出错误位置与说明
+          grep -vE '^\s*>?\s*[0-9]*\s*\|' "$log" | grep -iE 'error|failed|:[0-9]+:[0-9]+' | head -n 40
+          echo "::error::前端构建失败"
+          exit 1
+        fi
+        grep -E 'modules transformed|built in' "$log" || true
+        # 不打包：showcase（妙绘模板缩略图，运行时按需从站点取）、splash（iOS 启动图）；与 desktop/build.ps1 保持一致
+        rm -rf build/showcase build/splash
+        dist=../desktop/frontend/dist
+        find "$dist" -mindepth 1 ! -name .gitkeep -exec rm -rf {} +
+        cp -R build/. "$dist/"
+
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: src/desktop/go.mod
+        cache: false
+
+    - name: 定位 Go module 缓存目录
+      id: gomod
+      shell: bash
+      run: echo "dir=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@v6
+      with:
+        path: ${{ steps.gomod.outputs.dir }}
+        key: gomod-${{ runner.os }}-${{ inputs.wails-version }}-${{ hashFiles('src/desktop/go.sum') }}
+        restore-keys: gomod-${{ runner.os }}-
+
+    - name: 安装 Wails CLI
+      shell: bash
+      run: go install "github.com/wailsapp/wails/v2/cmd/wails@${{ inputs.wails-version }}"

@@ -1,0 +1,279 @@
+# 编译与发布 CZL AI 桌面端（Windows 安装包 + macOS dmg / zip）。
+#
+# 源码在私有仓库 woodchen-ink/czlai，编译放在这个公开仓库里跑：公开仓库的 Actions 不计分钟数，
+# 而私有仓库的 Windows runner 按 2 倍、macOS runner 按 10 倍计费。
+#
+# 触发方式：
+#   repository_dispatch (event_type: release)
+#       由私有仓库的 Release 流程发来，client_payload = { ref, sha, publish }：
+#       推 v* 标签时 publish=true，编译并以同名标签发布 Release；在私有仓库手动运行时取它的输入，
+#       publish=false 即试运行，只编译不发布。日常不用来这个仓库操作。
+#   workflow_dispatch
+#       在本仓库直接手动运行（补发 / 重跑），参数同上，sha 留空时按 ref 解析。
+#
+# 两种触发都只有对本仓库有写权限的人能发起；不监听 push / pull_request，fork 发来的 PR 碰不到 secret。
+#
+# 发布契约（站点按此识别安装包与校验和，改名须先改站点）：
+#   - 资产名 CZLAI-<os>-<arch>[-<kind>].<ext>，外加 SHA256SUMS；缺 SHA256SUMS 的 Release 整体不对外提供
+#   - 带 - 后缀的标签发布为 Pre-release，服务端只读 /releases/latest，预发布不会推给用户
+#   - 同一标签重跑时覆盖上传资产，不新建重复 Release
+#
+# 需要的 secret：
+#   SOURCE_TOKEN  对 woodchen-ink/czlai 有 Contents 只读权限的 fine-grained PAT
+# 发布用本仓库自带的 GITHUB_TOKEN。
+
+name: Release
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '源码的标签或分支，如 v2.82.0 或 main'
+        required: true
+        default: main
+      sha:
+        description: '源码 commit SHA（留空按 ref 解析）'
+        required: false
+        default: ''
+      publish:
+        description: '发布为 Release（只对 v* 标签生效）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# 同一个 ref 不并发，防止重复发布
+concurrency:
+  group: release-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: woodchen-ink/czlai
+  WAILS_VERSION: v2.16.0
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      publish: ${{ steps.r.outputs.publish }}
+      prerelease: ${{ steps.r.outputs.prerelease }}
+    steps:
+      - name: 解析 ref / SHA / 版本号
+        id: r
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          DISPATCH_REF: ${{ github.event.client_payload.ref }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_PUBLISH: ${{ github.event.client_payload.publish }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          if [ "$EVENT" = "repository_dispatch" ]; then
+            ref="$DISPATCH_REF" sha="$DISPATCH_SHA" publish="$DISPATCH_PUBLISH"
+          else
+            ref="$INPUT_REF" sha="$INPUT_SHA" publish="$INPUT_PUBLISH"
+          fi
+          [ "$publish" = "true" ] || publish=false
+
+          if [[ ! "$ref" =~ ^[A-Za-z0-9._/-]{1,100}$ ]]; then
+            echo "::error::非法 ref"; exit 1
+          fi
+          if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            version="$ref"
+          elif [ "$publish" = "true" ]; then
+            echo "::error::只有 vX.Y.Z 标签可以发布：$ref"; exit 1
+          else
+            # 分支试运行：版本号只用于产物内的版本标识
+            version="v0.0.0-dryrun"
+          fi
+
+          resolved=$(gh api "repos/${SOURCE_REPO}/commits/${ref}" --jq .sha)
+          if [ -z "$sha" ]; then
+            sha="$resolved"
+          elif [ "$sha" != "$resolved" ]; then
+            # 标签被移动过：以转发时的 SHA 为准，但要让人看见
+            echo "::warning::ref 当前指向 ${resolved}，按转发的 ${sha} 构建"
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::非法 SHA"; exit 1
+          fi
+
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          {
+            echo "sha=$sha"
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "ref=$ref sha=$sha version=$version publish=$publish prerelease=$prerelease"
+
+  windows:
+    needs: resolve
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 拉取源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          # 不把 token 留在 .git/config 里，后续步骤用不到它
+          persist-credentials: false
+
+      - uses: ./.github/actions/prepare
+        with:
+          version: ${{ needs.resolve.outputs.version }}
+          wails-version: ${{ env.WAILS_VERSION }}
+
+      - name: 安装 NSIS
+        shell: pwsh
+        run: |
+          $nsisDir = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          $env:PATH = "$nsisDir;$env:PATH"
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Chocolatey NSIS installation failed (exit $LASTEXITCODE); trying SourceForge"
+            }
+          }
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            # 官方 SourceForge 安装包；SHA256 对齐 microsoft/winget-pkgs 的 NSIS.NSIS 3.13。
+            $installer = Join-Path $env:RUNNER_TEMP 'nsis-3.13-setup.exe'
+            $url = 'https://sourceforge.net/projects/nsis/files/NSIS%203/3.13/nsis-3.13-setup.exe/download'
+            curl.exe --fail --location --retry 3 --connect-timeout 30 --max-time 180 --output $installer $url
+            if ($LASTEXITCODE -ne 0) { throw "SourceForge NSIS download failed (exit $LASTEXITCODE)" }
+            $expectedHash = 'DB9A1038BBC0E53FEF24F423FD609979BD578E942F1BE1198DB186D1C42652A3'
+            if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne $expectedHash) {
+              throw 'SourceForge NSIS installer SHA256 mismatch'
+            }
+            $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "NSIS installation failed (exit $($process.ExitCode))" }
+          }
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) { throw 'NSIS installation did not provide makensis' }
+          $nsisDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          makensis /VERSION
+          if ($LASTEXITCODE -ne 0) { throw "NSIS verification failed (exit $LASTEXITCODE)" }
+
+      - name: 测试
+        working-directory: src/desktop
+        run: go test ./...
+
+      - name: 编译并打安装包
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: ./src/desktop/build.ps1 $env:VERSION -SkipWeb
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: src/desktop/build/bin/CZLAI-windows-*-installer.exe
+          if-no-files-found: error
+          # 只给本次 publish 用，正式产物在 Release 里
+          retention-days: 1
+
+  macos:
+    needs: resolve
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 拉取源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - uses: ./.github/actions/prepare
+        with:
+          version: ${{ needs.resolve.outputs.version }}
+          wails-version: ${{ env.WAILS_VERSION }}
+
+      - name: 编译并打包
+        working-directory: src/desktop
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          PRODUCT_VERSION="${VERSION#v}"; PRODUCT_VERSION="${PRODUCT_VERSION%%-*}"
+          sed -i '' -E "s/\"productVersion\": *\"[^\"]*\"/\"productVersion\": \"${PRODUCT_VERSION}\"/" wails.json
+          # 不要加 -v 2：会把整个进程环境变量打进输出
+          "$(go env GOPATH)/bin/wails" build -platform darwin/universal -skipbindings -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}"
+          cd build/bin
+          app=$(ls -d *.app | head -n1)
+          # 未配置 Apple 开发者证书时做 ad-hoc 签名：Apple Silicon 要求可执行文件至少有签名
+          codesign --force --deep --sign - "$app"
+          # zip 供桌面端自动更新（updater 取 kind=archive 解压替换 .app），dmg 供用户下载安装（拖入「应用程序」）
+          ditto -c -k --keepParent "$app" CZLAI-darwin-universal.zip
+          rm -rf dmg-root && mkdir dmg-root
+          ditto "$app" "dmg-root/$app"
+          ln -s /Applications dmg-root/Applications
+          # GitHub macOS runner 上 hdiutil 偶发 "Resource busy"，重试几次
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname "CZL AI" -srcfolder dmg-root -fs HFS+ -format UDZO -ov CZLAI-darwin-universal.dmg && break
+            [ "$i" = 5 ] && exit 1
+            sleep $((i * 5))
+          done
+          rm -rf dmg-root
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos
+          path: |
+            src/desktop/build/bin/CZLAI-darwin-universal.zip
+            src/desktop/build/bin/CZLAI-darwin-universal.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [resolve, windows, macos]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 按名字只取两个平台的安装包
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: macos
+          path: dist
+
+      - name: 校验和
+        working-directory: dist
+        run: sha256sum CZLAI-* > SHA256SUMS && cat SHA256SUMS
+
+      - name: 发布 Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 重跑：覆盖同名资产，不新建 Release
+            gh release upload "$TAG" CZLAI-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            args=(--repo "$GITHUB_REPOSITORY" --title "$TAG"
+              --notes "CZL AI 桌面端 ${TAG}。下载与安装说明：https://ai.czl.net/download")
+            [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
+            gh release create "$TAG" CZLAI-* SHA256SUMS "${args[@]}"
+          fi
