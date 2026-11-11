@@ -1,4 +1,4 @@
-# 编译与发布 CZL AI 桌面端（Windows 安装包 + macOS dmg / zip）。
+# 编译与发布 CZL AI 客户端（Windows 安装包 + macOS dmg / zip + Android apk）。
 #
 # 源码在私有仓库 woodchen-ink/czlai，编译放在这个公开仓库里跑：公开仓库的 Actions 不计分钟数，
 # 而私有仓库的 Windows runner 按 2 倍、macOS runner 按 10 倍计费。
@@ -13,13 +13,17 @@
 #
 # 两种触发都只有对本仓库有写权限的人能发起；不监听 push / pull_request，fork 发来的 PR 碰不到 secret。
 #
-# 发布契约（站点按此识别安装包与校验和，改名须先改站点）：
-#   - 资产名 CZLAI-<os>-<arch>[-<kind>].<ext>，外加 SHA256SUMS；缺 SHA256SUMS 的 Release 整体不对外提供
+# 发布契约（站点按此识别安装包，改名须先改站点与 CZL Connect 发布源的别名）：
+#   - 资产名 CZLAI-<os>-<arch>[-<kind>].<ext>，外加 SHA256SUMS（供人工核对）
+#   - 对外分发走 CZL Connect「发布下载」：它读本仓库 Release，按别名公开附件、在 latest.json 给出 GitHub 计算的 sha256，
+#     站点 /api/desktop/* 读这份清单，客户端自动更新按 sha256 校验
 #   - 带 - 后缀的标签发布为 Pre-release，服务端只读 /releases/latest，预发布不会推给用户
 #   - 同一标签重跑时覆盖上传资产，不新建重复 Release
 #
 # 需要的 secret：
 #   SOURCE_REPO_TOKEN  对 woodchen-ink/czlai 有 Contents 只读权限的 fine-grained PAT
+#   ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD
+#                      Android 发布签名（base64 的 .jks）。换签名 = 已安装的用户无法覆盖升级，丢了也无法再发更新，务必备份
 # 发布用本仓库自带的 GITHUB_TOKEN。
 
 name: Release
@@ -239,14 +243,114 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  android:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: yarn
+          cache-dependency-path: src/web/yarn.lock
+
+      # 与 prepare 同样的防泄露处理：失败只打印错误位置与说明，不打印带源码的 code frame
+      - name: 构建前端
+        shell: bash
+        working-directory: src/web
+        env:
+          DISABLE_ESLINT_PLUGIN: 'true'
+          VITE_APP_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          yarn install --frozen-lockfile --silent
+          log="$RUNNER_TEMP/web-build.log"
+          if ! yarn build >"$log" 2>&1; then
+            grep -vE '^\s*>?\s*[0-9]*\s*\|' "$log" | grep -iE 'error|failed|:[0-9]+:[0-9]+' | head -n 40
+            echo "::error::前端构建失败"
+            exit 1
+          fi
+          grep -E 'modules transformed|built in' "$log" || true
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: src/mobile/core/go.mod
+          cache: false
+
+      - name: 定位 Go module 缓存目录
+        id: gomod
+        shell: bash
+        run: echo "dir=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: ${{ steps.gomod.outputs.dir }}
+          key: gomod-android-${{ hashFiles('src/mobile/core/go.sum') }}
+          restore-keys: gomod-android-
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 只缓存依赖下载与 wrapper 发行包，不缓存构建产物
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ hashFiles('src/mobile/android/**/*.gradle.kts', 'src/mobile/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: 测试 core
+        working-directory: src/mobile/core
+        run: go test ./...
+
+      # gomobile 版本取 core 的 go.mod（tools.go 钉住），NDK 用 runner 预装的最新版
+      - name: 安装 gomobile
+        working-directory: src/mobile/core
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
+          gomobile init
+
+      - name: 编译并打包
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          CZL_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          CZL_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          CZL_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then echo "::error::缺少 Android 签名 secret"; exit 1; fi
+          export CZL_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+          echo "$KEYSTORE_B64" | base64 -d > "$CZL_ANDROID_KEYSTORE"
+          bash src/mobile/android/scripts/build.sh "$VERSION" --web-prebuilt
+          rm -f "$CZL_ANDROID_KEYSTORE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: src/mobile/android/build/CZLAI-android-universal.apk
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    needs: [resolve, windows, macos]
+    needs: [resolve, windows, macos, android]
     if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # 按名字只取两个平台的安装包
+      # 按名字只取三个平台的安装包
       - uses: actions/download-artifact@v8
         with:
           name: windows
@@ -255,6 +359,11 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: macos
+          path: dist
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: android
           path: dist
 
       - name: 校验和
@@ -273,7 +382,7 @@ jobs:
             gh release upload "$TAG" CZLAI-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
           else
             args=(--repo "$GITHUB_REPOSITORY" --title "$TAG"
-              --notes "CZL AI 桌面端 ${TAG}。下载与安装说明：https://ai.czl.net/download")
+              --notes "CZL AI 客户端 ${TAG}（Windows / macOS / Android）。下载与安装说明：https://ai.czl.net/download")
             [ "$PRERELEASE" = "true" ] && args+=(--prerelease)
             gh release create "$TAG" CZLAI-* SHA256SUMS "${args[@]}"
           fi
